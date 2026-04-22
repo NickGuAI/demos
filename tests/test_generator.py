@@ -6,10 +6,14 @@ Run:
     python3 -m pytest tests/test_generator.py -v
     # or:
     python3 tests/test_generator.py
+
+Tests use injected fakes for the claude CLI so they do not require the
+`claude` binary to be installed. This is the guardrail that prevents silent
+degradation to keyword matching from returning — there is no static path
+to fall back to.
 """
 
 import json
-import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -18,14 +22,22 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 from generate_gcp_prompts import (
+    ClaudeCliMissingError,
     build_decision_prompt,
-    detect_components_static,
+    detect_components,
     generate,
     load_catalog,
     parse_decision_json,
     resolve_supporting,
     select_template,
 )
+
+
+def make_fake_claude(response: str):
+    """Return a stand-in for call_claude that yields a fixed response."""
+    def fake(prompt: str) -> str:
+        return response
+    return fake
 
 
 # ---------------------------------------------------------------------------
@@ -189,52 +201,43 @@ def test_build_prompt_includes_spec_and_catalog():
 
 
 # ---------------------------------------------------------------------------
-# Static fallback (detect_components_static)
+# detect_components with injected fake claude
 # ---------------------------------------------------------------------------
 
-def test_static_cloud_run_only():
-    """Static: web service signals select cloud_run."""
-    result = detect_components_static("Deploy a simple web application.")
-    assert "cloud_run" in result["selected"]
-    assert "alloydb" not in result["selected"]
-    assert result["method"] == "static"
-    print("PASS: test_static_cloud_run_only")
+def test_detect_components_uses_injected_caller():
+    """detect_components wires the fake response through to the result."""
+    fake = make_fake_claude(json.dumps({
+        "selected": ["cloud_run", "alloydb", "iam"],
+        "reasoning": {
+            "cloud_run": "HTTP service",
+            "alloydb": "relational data",
+            "iam": "service account",
+        },
+    }))
+    catalog = load_catalog()
+    decision = detect_components("A web app with PostgreSQL.", catalog, claude_caller=fake)
+    assert decision["selected"] == ["alloydb", "cloud_run", "iam"]
+    assert decision["method"] == "claude"
+    print("PASS: test_detect_components_uses_injected_caller")
 
 
-def test_static_alloydb_implies_iam():
-    """Static: database signals select alloydb + transitive iam."""
-    result = detect_components_static("Set up a PostgreSQL database.")
-    assert "alloydb" in result["selected"]
-    assert "iam" in result["selected"]
-    print("PASS: test_static_alloydb_implies_iam")
+def test_detect_components_propagates_claude_errors():
+    """If claude_caller raises, detect_components lets the exception propagate —
+    no silent degradation to keyword matching."""
+    def broken_caller(prompt: str) -> str:
+        raise RuntimeError("claude is down")
 
-
-def test_static_iam_only():
-    """Static: IAM signals select iam."""
-    result = detect_components_static("Configure IAM roles and service accounts.")
-    assert "iam" in result["selected"]
-    print("PASS: test_static_iam_only")
-
-
-def test_static_full_stack():
-    """Static: Book Journey spec selects all three."""
-    spec = (REPO_ROOT / "examples" / "book-journey" / "project.md").read_text()
-    result = detect_components_static(spec)
-    assert "cloud_run" in result["selected"]
-    assert "alloydb" in result["selected"]
-    assert "iam" in result["selected"]
-    print("PASS: test_static_full_stack")
-
-
-def test_static_no_signals():
-    """Static: irrelevant spec selects nothing."""
-    result = detect_components_static("Paint the fence blue.")
-    assert len(result["selected"]) == 0
-    print("PASS: test_static_no_signals")
+    catalog = load_catalog()
+    try:
+        detect_components("irrelevant spec", catalog, claude_caller=broken_caller)
+        assert False, "Should have raised"
+    except RuntimeError as e:
+        assert "claude is down" in str(e)
+    print("PASS: test_detect_components_propagates_claude_errors")
 
 
 # ---------------------------------------------------------------------------
-# Template selection (preserved from v1)
+# Template selection
 # ---------------------------------------------------------------------------
 
 def test_template_selection():
@@ -250,65 +253,96 @@ def test_template_selection():
 
 
 # ---------------------------------------------------------------------------
-# End-to-end (uses --static to avoid requiring claude CLI)
+# Guardrail: the static fallback must stay removed
 # ---------------------------------------------------------------------------
 
-def test_generate_end_to_end_static():
-    """Full pipeline with --static produces files."""
+def test_no_static_fallback_symbols():
+    """Regression guard: the script must not re-introduce keyword matching.
+
+    Deleted in chore/remove-static-fallback after the a118aa2 refactor. If
+    anyone resurrects STATIC_SIGNALS, detect_components_static, or a
+    --static flag, this test fails so we notice before silent-degradation
+    behavior ships.
+    """
+    import generate_gcp_prompts as mod
+    for forbidden in ("STATIC_SIGNALS", "detect_components_static"):
+        assert not hasattr(mod, forbidden), (
+            f"{forbidden} must stay removed — claude is the only detection path. "
+            f"If you need offline testing, mock call_claude via the claude_caller "
+            f"argument as test_detect_components_uses_injected_caller does."
+        )
+
+    script_src = (REPO_ROOT / "scripts" / "generate_gcp_prompts.py").read_text()
+    assert "--static" not in script_src, (
+        "--static CLI flag must stay removed — there is no static path."
+    )
+    print("PASS: test_no_static_fallback_symbols")
+
+
+# ---------------------------------------------------------------------------
+# End-to-end
+# ---------------------------------------------------------------------------
+
+def test_generate_end_to_end_with_fake_claude():
+    """Full pipeline with an injected fake claude caller produces files."""
+    fake_response = json.dumps({
+        "selected": ["alloydb", "cloud_run", "iam"],
+        "reasoning": {
+            "cloud_run": "multi-user web app serving HTTP",
+            "iam": "service account connectivity for AlloyDB",
+            "alloydb": "relational storage for users and checkpoints",
+        },
+        "supporting": ["artifact_registry", "secret_manager", "service_account", "vpc_network"],
+    })
+
     with tempfile.TemporaryDirectory() as tmpdir:
         spec_path = REPO_ROOT / "examples" / "book-journey" / "project.md"
         output_dir = Path(tmpdir) / "bundle"
         decision = generate(
-            str(spec_path), str(output_dir), emit_decision=True, use_static=True,
+            str(spec_path),
+            str(output_dir),
+            emit_decision=True,
+            claude_caller=make_fake_claude(fake_response),
         )
 
-        assert len(decision["selected"]) >= 3
-        assert decision["method"] == "static"
+        assert decision["method"] == "claude"
+        assert decision["selected"] == ["alloydb", "cloud_run", "iam"]
 
         # Prompt files written
         files = list(output_dir.glob("*.md"))
         assert len(files) >= 3, f"Expected >=3 prompt files, got {len(files)}"
 
-        # Decision JSON written
+        # Decision JSON written (no raw_response in the on-disk file)
         decision_file = Path(tmpdir) / "selected-components.json"
         assert decision_file.exists()
         data = json.loads(decision_file.read_text())
-        assert "selected" in data
-        assert "method" in data
+        assert data["method"] == "claude"
+        assert "raw_response" not in data
 
         # Templates contain project spec
         for f in files:
             content = f.read_text()
             assert "Book Journey" in content, f"{f.name} missing project spec"
 
-        print("PASS: test_generate_end_to_end_static")
+        print("PASS: test_generate_end_to_end_with_fake_claude")
 
 
-def test_generate_end_to_end_claude():
-    """Full pipeline with claude -p (skipped if claude not available)."""
-    if not shutil.which("claude"):
-        print("SKIP: test_generate_end_to_end_claude (claude CLI not found)")
-        return
+def test_claude_cli_missing_raises():
+    """If the real call_claude runs without the binary on PATH, ClaudeCliMissingError."""
+    from generate_gcp_prompts import call_claude
+    import shutil as _shutil
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        spec_path = REPO_ROOT / "examples" / "book-journey" / "project.md"
-        output_dir = Path(tmpdir) / "bundle"
-        decision = generate(
-            str(spec_path), str(output_dir), emit_decision=True, use_static=False,
-        )
-
-        assert len(decision["selected"]) >= 1
-        assert decision["method"] == "claude"
-
-        # Prompt files written
-        files = list(output_dir.glob("*.md"))
-        assert len(files) >= 1
-
-        # Decision JSON written
-        decision_file = Path(tmpdir) / "selected-components.json"
-        assert decision_file.exists()
-
-        print("PASS: test_generate_end_to_end_claude")
+    original_which = _shutil.which
+    _shutil.which = lambda name: None  # pretend claude is not installed
+    try:
+        try:
+            call_claude("noop")
+            assert False, "Should have raised ClaudeCliMissingError"
+        except ClaudeCliMissingError as e:
+            assert "claude" in str(e).lower()
+    finally:
+        _shutil.which = original_which
+    print("PASS: test_claude_cli_missing_raises")
 
 
 # ---------------------------------------------------------------------------
@@ -338,18 +372,18 @@ if __name__ == "__main__":
     # Prompt building
     test_build_prompt_includes_spec_and_catalog()
 
-    # Static detection
-    test_static_cloud_run_only()
-    test_static_alloydb_implies_iam()
-    test_static_iam_only()
-    test_static_full_stack()
-    test_static_no_signals()
+    # detect_components with injected fake claude
+    test_detect_components_uses_injected_caller()
+    test_detect_components_propagates_claude_errors()
 
     # Template selection
     test_template_selection()
 
+    # Guardrail
+    test_no_static_fallback_symbols()
+
     # End-to-end
-    test_generate_end_to_end_static()
-    test_generate_end_to_end_claude()
+    test_generate_end_to_end_with_fake_claude()
+    test_claude_cli_missing_raises()
 
     print("\n--- All tests passed ---")
