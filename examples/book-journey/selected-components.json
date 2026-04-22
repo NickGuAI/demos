@@ -4,39 +4,16 @@
     "cloud_run",
     "iam"
   ],
-  "matches": {
-    "cloud_run": [
-      {
-        "group": "web_service",
-        "keyword": "server",
-        "context": "You must create a `startup.sh` script that starts the server on the provided port. This script MUST ALSO programmaticall"
-      },
-      {
-        "group": "web_service",
-        "keyword": "landing page",
-        "context": "A multi-user reading journal where users add short \"journey checkpoints\" to pre-seeded books. Each book has a public lan"
-      }
-    ],
-    "iam": [
-      {
-        "group": "access_control",
-        "keyword": "authentication",
-        "context": "## Authentication (Username Only)"
-      }
-    ],
-    "alloydb": [
-      {
-        "group": "database",
-        "keyword": "database",
-        "context": "You must create a `startup.sh` script that starts the server on the provided port. This script MUST ALSO programmaticall"
-      }
-    ]
+  "reasoning": {
+    "cloud_run": "The project is a multi-user web application serving HTTP traffic (browse books, login, add checkpoints) that needs to be deployed as a container.",
+    "iam": "Required for service account connectivity between Cloud Run and AlloyDB, and for inter-service authentication.",
+    "alloydb": "The project requires persistent relational storage for users, checkpoints, and books with structured queries and referential integrity."
   },
-  "transitive": [],
   "supporting": [
     "artifact_registry",
-    "secret_manager",
+    "vpc_network",
     "service_account",
-    "vpc_network"
-  ]
+    "secret_manager"
+  ],
+  "method": "claude"
 }

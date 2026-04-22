@@ -1,140 +1,75 @@
-# GCP Component Decision Rules
+# GCP Component Catalog
 #
-# This file maps project signals (keywords, patterns, requirements) to
-# GCP components. The generator reads a project spec, matches signals,
-# and selects which components are needed.
+# This file describes available GCP components for the decision engine.
+# Claude reads this catalog + the project spec and decides which components
+# are needed, with reasoning per component.
 #
-# ┌─────────────────┐     ┌───────────────────┐     ┌──────────────────┐
-# │  Project Spec   │────→│  Decision Engine  │────→│  Selected        │
-# │  (markdown)     │     │  (match signals)  │     │  Components      │
-# └─────────────────┘     └───────────────────┘     └──────────────────┘
+# ┌─────────────────┐     ┌────────────────────┐     ┌──────────────────┐
+# │  Project Spec   │────→│  claude -p          │────→│  Selected        │
+# │  (markdown)     │     │  (reads catalog +   │     │  Components      │
+# │                 │     │   spec, returns     │     │  (JSON)          │
+# │                 │     │   structured JSON)  │     │                  │
+# └─────────────────┘     └────────────────────┘     └──────────────────┘
 #                                   │
 #                                   ▼
-#                         ┌───────────────────┐
-#                         │  This YAML file   │
-#                         │  (rules)          │
-#                         └───────────────────┘
+#                         ┌────────────────────┐
+#                         │  This YAML file    │
+#                         │  (component        │
+#                         │   catalog)         │
+#                         └────────────────────┘
 #
-# How matching works:
-# - Each component has a list of signal groups
-# - Each signal group has keywords (case-insensitive substring match)
-# - If ANY keyword in a group matches, that group is satisfied
-# - If ANY group is satisfied, the component is selected
-# - A component can also be force-selected via the "always" flag
-#
-# Human-editable: add/remove signals as your project patterns evolve.
+# Human-editable: add components, adjust descriptions,
+# or add notes that guide Claude's decision-making.
 
 components:
   cloud_run:
     description: "Serverless container deployment on Cloud Run"
-    signals:
-      - group: "web_service"
-        keywords:
-          - "web application"
-          - "web app"
-          - "REST API"
-          - "HTTP"
-          - "API endpoint"
-          - "backend service"
-          - "server"
-          - "frontend"
-          - "landing page"
-      - group: "deployment"
-        keywords:
-          - "deploy"
-          - "container"
-          - "docker"
-          - "serverless"
-          - "cloud run"
-      - group: "architecture"
-        keywords:
-          - "microservice"
-          - "service mesh"
-          - "load balancer"
-    transitive_requires: []
-    supporting_infra:
-      - "artifact_registry"
-      - "service_account"
+    use_when: >
+      The project is a web application, API service, backend, or any
+      workload that serves HTTP traffic and needs to be deployed as
+      a container.
+    not_needed_when: >
+      The project is purely a database setup, IAM configuration,
+      or batch job with no HTTP serving component.
 
   iam:
-    description: "IAM roles, bindings, and service accounts"
-    signals:
-      - group: "access_control"
-        keywords:
-          - "authentication"
-          - "authorization"
-          - "permission"
-          - "role"
-          - "access control"
-          - "RBAC"
-      - group: "service_identity"
-        keywords:
-          - "service account"
-          - "service-to-service"
-          - "workload identity"
-      - group: "security"
-        keywords:
-          - "IAM"
-          - "policy binding"
-          - "least privilege"
-          - "public access"
-          - "unauthenticated"
-    transitive_requires: []
-    supporting_infra:
-      - "service_account"
+    description: "IAM roles, service accounts, and policy bindings"
+    use_when: >
+      The project needs service accounts, role bindings, access control
+      between GCP services, or any form of identity/permission management.
+      Always needed when AlloyDB is selected (service account connectivity).
+    not_needed_when: >
+      The project uses only default compute credentials and has no
+      inter-service authentication requirements.
 
   alloydb:
-    description: "AlloyDB for PostgreSQL managed database"
-    signals:
-      - group: "database"
-        keywords:
-          - "database"
-          - "PostgreSQL"
-          - "postgres"
-          - "SQL"
-          - "relational"
-          - "AlloyDB"
-      - group: "data_operations"
-        keywords:
-          - "CRUD"
-          - "query"
-          - "transaction"
-          - "migration"
-          - "schema"
-          - "table"
-      - group: "persistence"
-        keywords:
-          - "persistent storage"
-          - "data store"
-          - "user data"
-          - "records"
-    transitive_requires:
-      - "iam"  # AlloyDB always needs IAM for service account connectivity
-    supporting_infra:
-      - "vpc_network"
-      - "service_account"
-      - "secret_manager"
+    description: "AlloyDB for PostgreSQL — managed relational database"
+    use_when: >
+      The project requires persistent relational data storage, user data,
+      SQL queries, transactions, or mentions PostgreSQL/database needs.
+    not_needed_when: >
+      The project is a static site, uses only in-memory state, or
+      explicitly uses a different database (Firestore, BigQuery, etc.).
 
-# Supporting infrastructure components (auto-included when a main component needs them)
+# Supporting infrastructure — Claude should mention these when relevant
 supporting:
   artifact_registry:
     description: "Container image storage for Cloud Run"
-    when: "cloud_run"
+    needed_with: "cloud_run"
 
   vpc_network:
     description: "VPC networking for AlloyDB private connectivity"
-    when: "alloydb"
+    needed_with: "alloydb"
 
   service_account:
     description: "Dedicated service account for least-privilege access"
-    when: "any"
+    needed_with: "any component"
 
   secret_manager:
     description: "Secret Manager for database credentials"
-    when: "alloydb"
+    needed_with: "alloydb"
 
 # Template selection matrix
-# Maps component combinations to prompt template files
 template_matrix:
   cloud_run: "cloud-run.md"
   iam: "iam.md"
