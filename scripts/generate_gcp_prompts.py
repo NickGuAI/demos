@@ -3,9 +3,9 @@
 GCP Augmentation Prompt Generator (model-driven)
 
 Takes a project spec (markdown) and:
-1. Sends it to `claude -p` along with the GCP component catalog
-2. Claude analyzes the spec and returns structured JSON with selected components
-3. Renders the matching prompt templates for those components
+1. Sends it to `claude -p` along with the GCP component catalog.
+2. Claude analyzes the spec and returns structured JSON with selected components.
+3. Renders the matching prompt templates for those components.
 
 Usage:
     python3 scripts/generate_gcp_prompts.py examples/book-journey/project.md
@@ -16,20 +16,22 @@ Usage:
     # Also emit the decision JSON:
     python3 scripts/generate_gcp_prompts.py spec.md --emit-decision
 
-    # Use static fallback (skip claude, keyword matching only):
-    python3 scripts/generate_gcp_prompts.py spec.md --static
+Requires: Python 3.8+, PyYAML, and the `claude` CLI on PATH.
+If `claude` is unavailable or returns an error, the script fails loudly —
+there is no silent fallback. Use a mocked `call_claude` for tests (see
+`tests/test_generator.py`).
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import Callable
 
 import yaml
 
@@ -120,8 +122,27 @@ Determine which components are needed. Respond with ONLY the JSON object, \
 nothing else."""
 
 
+class ClaudeCliMissingError(RuntimeError):
+    """Raised when the `claude` CLI binary is not available on PATH."""
+
+
+class ClaudeInvocationError(RuntimeError):
+    """Raised when `claude -p` exits non-zero or cannot be parsed."""
+
+
 def call_claude(prompt: str) -> str:
-    """Call `claude -p` and return stdout."""
+    """Call `claude -p` and return stdout.
+
+    Raises:
+        ClaudeCliMissingError: if the `claude` binary is not on PATH.
+        ClaudeInvocationError: if claude exits non-zero.
+    """
+    if not shutil.which("claude"):
+        raise ClaudeCliMissingError(
+            "The `claude` CLI is required for model-driven component detection "
+            "but was not found on PATH. Install Claude Code (https://claude.com/claude-code) "
+            "and retry."
+        )
     result = subprocess.run(
         ["claude", "-p", prompt, "--output-format", "text"],
         capture_output=True,
@@ -129,7 +150,7 @@ def call_claude(prompt: str) -> str:
         timeout=120,
     )
     if result.returncode != 0:
-        raise RuntimeError(
+        raise ClaudeInvocationError(
             f"claude -p failed (exit {result.returncode}): {result.stderr.strip()}"
         )
     return result.stdout.strip()
@@ -208,10 +229,20 @@ def parse_decision_json(raw: str) -> dict:
     return _validate_decision(data)
 
 
-def detect_components_with_claude(spec_text: str, catalog: dict) -> dict:
-    """Use claude -p to analyze spec and select components."""
+def detect_components(
+    spec_text: str,
+    catalog: dict,
+    claude_caller: Callable[[str], str] = call_claude,
+) -> dict:
+    """Use claude -p to analyze spec and select components.
+
+    `claude_caller` is injected so tests can supply a fake that returns a
+    canned JSON response without requiring the real `claude` binary. The
+    default calls the real CLI; production code paths never need to pass
+    anything other than the default.
+    """
     prompt = build_decision_prompt(spec_text, catalog)
-    raw_response = call_claude(prompt)
+    raw_response = claude_caller(prompt)
     decision = parse_decision_json(raw_response)
     decision["method"] = "claude"
     decision["raw_response"] = raw_response
@@ -219,58 +250,7 @@ def detect_components_with_claude(spec_text: str, catalog: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Static fallback (keyword matching — for offline / testing)
-# ---------------------------------------------------------------------------
-
-STATIC_SIGNALS = {
-    "cloud_run": [
-        "web application", "web app", "rest api", "http", "api endpoint",
-        "backend service", "server", "frontend", "landing page", "deploy",
-        "container", "docker", "serverless", "cloud run", "microservice",
-    ],
-    "iam": [
-        "authentication", "authorization", "permission", "role",
-        "access control", "service account", "iam", "policy binding",
-    ],
-    "alloydb": [
-        "database", "postgresql", "postgres", "sql", "relational",
-        "alloydb", "crud", "query", "transaction", "migration", "schema",
-        "table", "persistent storage", "data store", "user data",
-    ],
-}
-
-
-def detect_components_static(spec_text: str) -> dict:
-    """Keyword-based fallback when claude is unavailable."""
-    spec_lower = spec_text.lower()
-    selected = []
-    reasoning = {}
-
-    for comp, keywords in STATIC_SIGNALS.items():
-        matched = [kw for kw in keywords if kw in spec_lower]
-        if matched:
-            selected.append(comp)
-            reasoning[comp] = f"Matched keywords: {', '.join(matched[:3])}"
-        else:
-            reasoning[comp] = None
-
-    selected = sorted(selected)
-
-    # Transitive: alloydb requires iam
-    if "alloydb" in selected and "iam" not in selected:
-        selected = sorted(selected + ["iam"])
-        reasoning["iam"] = "Required transitively by alloydb."
-
-    return {
-        "selected": selected,
-        "reasoning": reasoning,
-        "supporting": resolve_supporting(selected),
-        "method": "static",
-    }
-
-
-# ---------------------------------------------------------------------------
-# Template selection and rendering (preserved from v1)
+# Template selection and rendering
 # ---------------------------------------------------------------------------
 
 def select_template(selected: list[str], catalog: dict) -> str | None:
@@ -304,11 +284,14 @@ def generate(
     spec_path: str,
     output_dir: str | None = None,
     emit_decision: bool = False,
-    use_static: bool = False,
+    claude_caller: Callable[[str], str] = call_claude,
 ) -> dict:
     """Main generation pipeline.
 
     Returns the decision result dict. Side-effects: writes files to output_dir.
+
+    `claude_caller` is injected for testability — production callers never
+    pass it (the default hits the real claude CLI).
     """
     spec_path = Path(spec_path)
     if not spec_path.exists():
@@ -318,25 +301,9 @@ def generate(
     spec_text = spec_path.read_text()
     catalog = load_catalog()
 
-    # Step 1: Component detection
-    if use_static:
-        decision = detect_components_static(spec_text)
-    else:
-        if not shutil.which("claude"):
-            print(
-                "Warning: claude CLI not found, falling back to static detection.",
-                file=sys.stderr,
-            )
-            decision = detect_components_static(spec_text)
-        else:
-            try:
-                decision = detect_components_with_claude(spec_text, catalog)
-            except Exception as e:
-                print(
-                    f"Warning: claude -p failed ({e}), falling back to static detection.",
-                    file=sys.stderr,
-                )
-                decision = detect_components_static(spec_text)
+    # Component detection — claude is the only path. Any failure is a loud
+    # error, not a silent degradation to keyword matching.
+    decision = detect_components(spec_text, catalog, claude_caller=claude_caller)
 
     selected = decision["selected"]
 
@@ -344,17 +311,17 @@ def generate(
         print("No GCP components detected in the project spec.")
         sys.exit(0)
 
-    # Step 2: Select template
+    # Select template
     template_file = select_template(selected, catalog)
 
-    # Step 3: Set up output
+    # Set up output
     if output_dir is None:
         output_dir = Path(spec_path).parent / "prompt-bundle"
     else:
         output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Step 4: Emit decision file
+    # Emit decision file
     if emit_decision:
         decision_out = {k: v for k, v in decision.items() if k != "raw_response"}
         decision_path = output_dir.parent / "selected-components.json"
@@ -362,7 +329,7 @@ def generate(
             json.dump(decision_out, f, indent=2)
         print(f"Decision: {decision_path}")
 
-    # Step 5: Render and write prompts
+    # Render and write prompts
     written = []
 
     # Write the composite template
@@ -385,7 +352,7 @@ def generate(
                 out_file.write_text(rendered)
                 written.append(str(out_file))
 
-    # Step 6: Print summary
+    # Summary
     method = decision.get("method", "unknown")
     print(f"Project: {spec_path.name}")
     print(f"Detection: {method}")
@@ -405,7 +372,7 @@ def generate(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate GCP augmentation prompts from a project spec."
+        description="Generate GCP augmentation prompts from a project spec.",
     )
     parser.add_argument("spec", help="Path to the project spec markdown file")
     parser.add_argument("--output-dir", help="Output directory for prompt bundle")
@@ -414,13 +381,15 @@ def main():
         action="store_true",
         help="Also emit the component decision JSON",
     )
-    parser.add_argument(
-        "--static",
-        action="store_true",
-        help="Use static keyword matching instead of claude -p",
-    )
     args = parser.parse_args()
-    generate(args.spec, args.output_dir, args.emit_decision, args.static)
+    try:
+        generate(args.spec, args.output_dir, args.emit_decision)
+    except ClaudeCliMissingError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(2)
+    except ClaudeInvocationError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(3)
 
 
 if __name__ == "__main__":

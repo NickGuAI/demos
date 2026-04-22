@@ -26,9 +26,7 @@ Generate GCP deployment prompts from project specs. Takes a markdown project spe
                         └────────────────────┘
 ```
 
-The decision step is **model-driven**: Claude reads the full project spec and the component catalog (`rules/gcp-component-decision.yaml`), then returns a structured JSON decision with per-component reasoning. This replaces static keyword matching — the model understands context, intent, and implicit requirements.
-
-A `--static` flag provides a keyword-based fallback for offline use or CI.
+The decision step is **model-driven**: Claude reads the full project spec and the component catalog (`rules/gcp-component-decision.yaml`), then returns a structured JSON decision with per-component reasoning. Claude is the **only** detection path — there is no keyword-matching fallback. Missing `claude` CLI or a `claude -p` error surfaces as a loud error, not a silent degradation.
 
 ## Quick Start
 
@@ -41,12 +39,22 @@ python3 scripts/generate_gcp_prompts.py path/to/project-spec.md --emit-decision
 
 # Custom output directory
 python3 scripts/generate_gcp_prompts.py spec.md --output-dir ./my-output
-
-# Offline / CI mode (static keyword matching, no claude call)
-python3 scripts/generate_gcp_prompts.py spec.md --static
 ```
 
-Requires: Python 3.8+, PyYAML (`pip3 install pyyaml`), and `claude` CLI (for model-driven mode).
+**Requires:** Python 3.8+, PyYAML (`pip3 install pyyaml`), and `claude` CLI on PATH.
+
+If you need to run without the `claude` binary (tests, isolated runs), import the library form and pass a fake `claude_caller`:
+
+```python
+from generate_gcp_prompts import generate
+
+def my_fake_claude(prompt):
+    return '{"selected": ["cloud_run"], "reasoning": {"cloud_run": "..."}}'
+
+generate("spec.md", claude_caller=my_fake_claude)
+```
+
+This is how the test suite works — see `tests/test_generator.py`.
 
 ## Worked Example: Book Journey
 
@@ -70,13 +78,15 @@ Output:
 1. **Decision JSON** (`--emit-decision`): Which components were selected, why (per-component reasoning from Claude), and which detection method was used
 2. **Prompt bundle**: One composite template + individual component templates, each with the project spec injected
 
-### Detection Modes
+### Detection
 
-| Mode | Flag | How it works |
-|------|------|-------------|
-| Model-driven (default) | _(none)_ | `claude -p` reads spec + catalog, returns structured JSON |
-| Static fallback | `--static` | Keyword matching against hardcoded signal lists |
-| Auto-fallback | _(none)_ | If `claude` CLI is missing or fails, falls back to static |
+Claude (`claude -p`) reads the spec and the component catalog and returns a structured JSON decision. That is the only path. Failures are explicit:
+
+- `claude` CLI not on PATH → `ClaudeCliMissingError`, exit 2
+- `claude -p` returns non-zero → `ClaudeInvocationError`, exit 3
+- Response is unparseable / schema-invalid → `ValueError` / `json.JSONDecodeError` at the call site
+
+No silent degradation. If you see a result with `"method": "claude"`, it truly came from Claude.
 
 ## Project Structure
 
@@ -135,7 +145,9 @@ components:
 python3 tests/test_generator.py
 ```
 
-22 tests covering: catalog loading, JSON parsing (clean/fenced/invalid), transitive dependency enforcement, supporting infra resolution, prompt construction, static detection, template selection, and end-to-end generation (both static and claude modes).
+20 tests covering: catalog loading, JSON parsing (clean/fenced/invalid), transitive dependency enforcement, supporting infra resolution, prompt construction, template selection, `detect_components` with an injected fake claude caller, error propagation, end-to-end pipeline with a fake caller, and `ClaudeCliMissingError` when the binary is absent.
+
+Tests do not require the `claude` binary — they inject a fake `claude_caller`. There is also a **regression guard** (`test_no_static_fallback_symbols`) that fails if anyone re-introduces `STATIC_SIGNALS`, `detect_components_static`, or a `--static` CLI flag. Keyword matching is not a fallback path; it is gone.
 
 ## Research Archive
 
