@@ -277,6 +277,217 @@ def render_template(template_path: Path, spec_text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Per-project resource management script generation
+# ---------------------------------------------------------------------------
+
+_VALIDATE_HEADER = """\
+#!/usr/bin/env bash
+# Auto-generated: validate deployed GCP resources.
+# Components: %s
+# Supporting: %s
+#
+# Usage: bash validate.sh <PROJECT_ID> [REGION]
+
+set -euo pipefail
+
+PROJECT_ID="${1:?Usage: bash validate.sh <PROJECT_ID> [REGION]}"
+REGION="${2:-us-central1}"
+
+echo "Scanning project '$PROJECT_ID' (region: $REGION)..."
+echo
+"""
+
+_CLEANUP_HEADER = """\
+#!/usr/bin/env bash
+# Auto-generated: clean up deployed GCP resources.
+# Components: %s
+# Supporting: %s
+#
+# Usage:
+#   DRY_RUN=true  bash cleanup.sh <PROJECT_ID> [REGION]   # preview (default)
+#   DRY_RUN=false bash cleanup.sh <PROJECT_ID> [REGION]   # actually delete
+
+set -euo pipefail
+
+PROJECT_ID="${1:?Usage: bash cleanup.sh <PROJECT_ID> [REGION]}"
+REGION="${2:-us-central1}"
+DRY_RUN="${DRY_RUN:-true}"
+
+delete() {
+  local label="$1"; shift
+  if [ "$DRY_RUN" = "true" ]; then
+    echo "  [dry-run] $label"
+  else
+    echo "  [delete]  $label"
+    if "$@" 2>/dev/null; then
+      echo "            done"
+    else
+      echo "            FAILED (may already be deleted)"
+    fi
+  fi
+}
+
+echo "Cleanup for project '$PROJECT_ID' (region: $REGION, dry_run: $DRY_RUN)"
+echo
+"""
+
+# Validate sections: (gate_names, bash_fragment).
+# Included when any gate name appears in (selected | supporting).
+
+_VALIDATE_SECTIONS = [
+    (("cloud_run",), """\
+echo "=== Cloud Run Services ==="
+gcloud run services list --project="$PROJECT_ID" --region="$REGION" \\
+  --format="table(name,status.url)" 2>/dev/null || echo "  (none)"
+echo
+"""),
+    (("artifact_registry",), """\
+echo "=== Artifact Registry Repos ==="
+gcloud artifacts repositories list --project="$PROJECT_ID" --location="$REGION" \\
+  --format="table(REPOSITORY,FORMAT,CREATE_TIME)" 2>/dev/null || echo "  (none)"
+echo
+"""),
+    (("service_account", "iam"), """\
+echo "=== Service Accounts (user-created) ==="
+gcloud iam service-accounts list --project="$PROJECT_ID" \\
+  --format="table(email,displayName)" \\
+  --filter="email!~(developer|appspot|cloudbuild|compute)" 2>/dev/null || echo "  (none)"
+echo
+"""),
+    (("alloydb",), """\
+echo "=== AlloyDB Clusters ==="
+CLUSTERS=$(gcloud alloydb clusters list --project="$PROJECT_ID" --region="$REGION" \\
+  --format="value(name)" 2>/dev/null)
+if [ -n "$CLUSTERS" ]; then
+  gcloud alloydb clusters list --project="$PROJECT_ID" --region="$REGION" \\
+    --format="table(name,state)" 2>/dev/null
+  echo
+  echo "--- AlloyDB Instances ---"
+  while IFS= read -r cluster; do
+    gcloud alloydb instances list --project="$PROJECT_ID" --region="$REGION" \\
+      --cluster="$cluster" --format="table(name,instanceType,state)" 2>/dev/null
+  done <<< "$CLUSTERS"
+else
+  echo "  (none)"
+fi
+echo
+"""),
+    (("secret_manager",), """\
+echo "=== Secrets ==="
+gcloud secrets list --project="$PROJECT_ID" \\
+  --format="table(name,createTime)" 2>/dev/null || echo "  (none)"
+echo
+"""),
+    (("vpc_network",), """\
+echo "=== VPC Networks (non-default) ==="
+gcloud compute networks list --project="$PROJECT_ID" \\
+  --format="table(name,subnetMode)" \\
+  --filter="name!=default" 2>/dev/null || echo "  (none)"
+echo
+
+echo "=== Compute Addresses (PSA) ==="
+gcloud compute addresses list --project="$PROJECT_ID" --global \\
+  --format="table(name,purpose,status)" 2>/dev/null || echo "  (none)"
+echo
+"""),
+]
+
+# Cleanup sections: ordered by deletion dependency (first deleted first).
+
+_CLEANUP_SECTIONS = [
+    (("cloud_run",), """\
+echo "--- Cloud Run Services ---"
+for resource in $(gcloud run services list --project="$PROJECT_ID" --region="$REGION" --format="value(name)" 2>/dev/null); do
+  delete "Cloud Run service: $resource" \\
+    gcloud run services delete "$resource" --project="$PROJECT_ID" --region="$REGION" --quiet
+done
+"""),
+    (("artifact_registry",), """\
+echo "--- Artifact Registry Repos ---"
+for resource in $(gcloud artifacts repositories list --project="$PROJECT_ID" --location="$REGION" --format="value(REPOSITORY)" 2>/dev/null); do
+  delete "Artifact Registry repo: $resource" \\
+    gcloud artifacts repositories delete "$resource" --project="$PROJECT_ID" --location="$REGION" --quiet
+done
+"""),
+    (("secret_manager",), """\
+echo "--- Secrets ---"
+for resource in $(gcloud secrets list --project="$PROJECT_ID" --format="value(name)" 2>/dev/null); do
+  delete "Secret: $resource" \\
+    gcloud secrets delete "$resource" --project="$PROJECT_ID" --quiet
+done
+"""),
+    (("alloydb",), """\
+echo "--- AlloyDB ---"
+for cluster in $(gcloud alloydb clusters list --project="$PROJECT_ID" --region="$REGION" --format="value(name)" 2>/dev/null); do
+  for inst in $(gcloud alloydb instances list --project="$PROJECT_ID" --region="$REGION" --cluster="$cluster" --format="value(name)" 2>/dev/null); do
+    delete "AlloyDB instance: $inst (cluster: $cluster)" \\
+      gcloud alloydb instances delete "$inst" --cluster="$cluster" --project="$PROJECT_ID" --region="$REGION" --quiet
+  done
+  delete "AlloyDB cluster: $cluster" \\
+    gcloud alloydb clusters delete "$cluster" --project="$PROJECT_ID" --region="$REGION" --quiet
+done
+"""),
+    (("service_account", "iam"), """\
+echo "--- Service Accounts ---"
+for resource in $(gcloud iam service-accounts list --project="$PROJECT_ID" --format="value(email)" --filter="email!~(developer|appspot|cloudbuild|compute)" 2>/dev/null); do
+  delete "Service account: $resource" \\
+    gcloud iam service-accounts delete "$resource" --project="$PROJECT_ID" --quiet
+done
+"""),
+    (("vpc_network",), """\
+echo "--- Compute Addresses (PSA) ---"
+for resource in $(gcloud compute addresses list --project="$PROJECT_ID" --global --format="value(name)" 2>/dev/null); do
+  delete "Compute address: $resource" \\
+    gcloud compute addresses delete "$resource" --project="$PROJECT_ID" --global --quiet
+done
+"""),
+    (("vpc_network",), """\
+echo "--- VPC Networks (non-default) ---"
+for resource in $(gcloud compute networks list --project="$PROJECT_ID" --format="value(name)" --filter="name!=default" 2>/dev/null); do
+  delete "VPC network: $resource" \\
+    gcloud compute networks delete "$resource" --project="$PROJECT_ID" --quiet
+done
+"""),
+]
+
+
+def _select_sections(
+    sections: list[tuple[tuple[str, ...], str]],
+    selected: list[str],
+    supporting: list[str],
+) -> list[str]:
+    """Return bash fragments whose gate matches the active component set."""
+    active = set(selected) | set(supporting)
+    return [code for gates, code in sections if set(gates) & active]
+
+
+def generate_validate_script(selected: list[str], supporting: list[str]) -> str:
+    """Generate a bash script that discovers and lists deployed resources."""
+    header = _VALIDATE_HEADER % (
+        ", ".join(sorted(selected)),
+        ", ".join(sorted(supporting)),
+    )
+    body = "\n".join(_select_sections(_VALIDATE_SECTIONS, selected, supporting))
+    return header + body + 'echo "--- Validation complete ---"\n'
+
+
+def generate_cleanup_script(selected: list[str], supporting: list[str]) -> str:
+    """Generate a bash script that discovers and deletes deployed resources."""
+    header = _CLEANUP_HEADER % (
+        ", ".join(sorted(selected)),
+        ", ".join(sorted(supporting)),
+    )
+    body = "\n".join(_select_sections(_CLEANUP_SECTIONS, selected, supporting))
+    footer = (
+        '\necho\necho "--- Cleanup complete ---"\n'
+        'if [ "$DRY_RUN" = "true" ]; then\n'
+        '  echo "This was a dry run. Set DRY_RUN=false to actually delete."\n'
+        "fi\n"
+    )
+    return header + body + footer
+
+
+# ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
 
@@ -351,6 +562,16 @@ def generate(
             if str(out_file) not in written:
                 out_file.write_text(rendered)
                 written.append(str(out_file))
+
+    # Write resource management scripts
+    supporting = decision.get("supporting", [])
+    validate_sh = generate_validate_script(selected, supporting)
+    (output_dir / "validate.sh").write_text(validate_sh)
+    written.append(str(output_dir / "validate.sh"))
+
+    cleanup_sh = generate_cleanup_script(selected, supporting)
+    (output_dir / "cleanup.sh").write_text(cleanup_sh)
+    written.append(str(output_dir / "cleanup.sh"))
 
     # Summary
     method = decision.get("method", "unknown")

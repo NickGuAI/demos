@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-Tests for validate_resources.py and cleanup_resources.py.
+Tests for dynamic resource script generation and the global scanner.
 
 Run:
     python3 -m pytest tests/test_resource_scripts.py -v
 """
 
-import argparse
 import json
 import sys
 import tempfile
@@ -16,262 +15,301 @@ from unittest.mock import patch
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
-from gcp_resource_config import (
-    derive_defaults,
-    detect_components,
-    load_components_json,
-    parse_config_file,
+from generate_gcp_prompts import (
+    generate_cleanup_script,
+    generate_validate_script,
+    generate,
+    _select_sections,
+    _VALIDATE_SECTIONS,
+    _CLEANUP_SECTIONS,
 )
-from validate_resources import build_checks
-from cleanup_resources import build_cleanup_steps
+from scan_project_resources import RESOURCE_TYPES, _discover_alloydb, scan
+
+
+def make_fake_claude(response: str):
+    def fake(prompt: str) -> str:
+        return response
+    return fake
 
 
 # ---------------------------------------------------------------------------
-# Config parsing
+# _select_sections
 # ---------------------------------------------------------------------------
 
-def test_parse_config_file():
-    """Config file parses KEY=VALUE pairs, ignoring comments."""
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".env", delete=False) as f:
-        f.write('# GCP config\n')
-        f.write('PROJECT_ID="my-project"\n')
-        f.write("REGION=us-west1\n")
-        f.write("SERVICE_NAME='book-journey'\n")
-        f.write("\n")
-        f.write("# AlloyDB\n")
-        f.write("CLUSTER_NAME=my-cluster\n")
-        f.name
-    config = parse_config_file(f.name)
-    assert config["PROJECT_ID"] == "my-project"
-    assert config["REGION"] == "us-west1"
-    assert config["SERVICE_NAME"] == "book-journey"
-    assert config["CLUSTER_NAME"] == "my-cluster"
+def test_select_sections_matches_gates():
+    """Sections are included when any gate name matches active components."""
+    sections = [
+        (("cloud_run",), "CLOUD_RUN"),
+        (("alloydb",), "ALLOYDB"),
+        (("service_account", "iam"), "SA"),
+    ]
+    result = _select_sections(sections, ["cloud_run"], ["service_account"])
+    assert result == ["CLOUD_RUN", "SA"]
 
 
-def test_parse_config_strips_quotes():
-    """Both single and double quotes are stripped from values."""
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".env", delete=False) as f:
-        f.write('A="double"\n')
-        f.write("B='single'\n")
-        f.write("C=none\n")
-    config = parse_config_file(f.name)
-    assert config["A"] == "double"
-    assert config["B"] == "single"
-    assert config["C"] == "none"
+def test_select_sections_empty_active():
+    """No active components = no sections."""
+    assert _select_sections(_VALIDATE_SECTIONS, [], []) == []
 
 
-# ---------------------------------------------------------------------------
-# Components detection
-# ---------------------------------------------------------------------------
-
-def test_load_components_json():
-    """Components loaded from decision JSON."""
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-        json.dump({"selected": ["cloud_run", "alloydb"], "reasoning": {}}, f)
-    components = load_components_json(f.name)
-    assert components == {"cloud_run", "alloydb"}
-
-
-def test_detect_components_cloud_run_only():
-    """Service name alone implies cloud_run + iam."""
-    args = argparse.Namespace(service_name="my-svc", cluster_name=None)
-    assert detect_components(args) == {"cloud_run", "iam"}
-
-
-def test_detect_components_alloydb():
-    """Cluster name implies alloydb + iam."""
-    args = argparse.Namespace(service_name=None, cluster_name="my-cluster")
-    assert detect_components(args) == {"alloydb", "iam"}
-
-
-def test_detect_components_full_stack():
-    """Both service and cluster implies all three."""
-    args = argparse.Namespace(service_name="svc", cluster_name="cluster")
-    assert detect_components(args) == {"cloud_run", "alloydb", "iam"}
-
-
-def test_detect_components_empty():
-    """No args means no components."""
-    args = argparse.Namespace(service_name=None, cluster_name=None)
-    assert detect_components(args) == set()
-
-
-# ---------------------------------------------------------------------------
-# Derive defaults
-# ---------------------------------------------------------------------------
-
-def _make_args(**overrides):
-    defaults = dict(
-        project_id="test-proj",
-        region="us-central1",
-        service_name=None,
-        cluster_name=None,
-        instance_name=None,
-        network_name=None,
-        repo_name=None,
-        secret_name=None,
-        sa_name=None,
-        sa_email=None,
+def test_select_sections_full_stack():
+    """Full stack activates all sections."""
+    result = _select_sections(
+        _VALIDATE_SECTIONS,
+        ["cloud_run", "iam", "alloydb"],
+        ["artifact_registry", "vpc_network", "service_account", "secret_manager"],
     )
-    defaults.update(overrides)
-    return argparse.Namespace(**defaults)
-
-
-def test_derive_defaults_repo_from_service():
-    """Repo name defaults to service name."""
-    args = _make_args(service_name="my-svc")
-    derive_defaults(args)
-    assert args.repo_name == "my-svc"
-
-
-def test_derive_defaults_secret_from_service():
-    """Secret name defaults to {service}-db-pass when alloydb present."""
-    args = _make_args(service_name="my-svc", cluster_name="my-cluster")
-    derive_defaults(args)
-    assert args.secret_name == "my-svc-db-pass"
-
-
-def test_derive_defaults_no_secret_without_cluster():
-    """Secret name not derived without a cluster."""
-    args = _make_args(service_name="my-svc")
-    derive_defaults(args)
-    assert args.secret_name is None
-
-
-def test_derive_defaults_sa_email():
-    """SA email derived from sa_name and project_id."""
-    args = _make_args(service_name="my-svc")
-    derive_defaults(args)
-    assert args.sa_name == "my-svc-sa"
-    assert args.sa_email == "my-svc-sa@test-proj.iam.gserviceaccount.com"
+    assert len(result) == len(_VALIDATE_SECTIONS)
 
 
 # ---------------------------------------------------------------------------
-# Validate: build_checks
+# generate_validate_script
 # ---------------------------------------------------------------------------
 
-def test_build_checks_cloud_run():
-    """Cloud Run component produces service + repo + SA checks."""
-    args = _make_args(service_name="svc")
-    derive_defaults(args)
-    checks = build_checks(args, {"cloud_run", "iam"})
-    descs = [c[0] for c in checks]
-    assert any("Cloud Run service" in d for d in descs)
-    assert any("Artifact Registry" in d for d in descs)
-    assert any("Service account" in d for d in descs)
+def test_validate_script_header():
+    """Validate script has shebang, component list, and usage."""
+    script = generate_validate_script(["cloud_run"], ["artifact_registry", "service_account"])
+    assert script.startswith("#!/usr/bin/env bash")
+    assert "cloud_run" in script
+    assert "artifact_registry" in script
+    assert "$PROJECT_ID" in script
+    assert "$REGION" in script
 
 
-def test_build_checks_alloydb():
-    """AlloyDB component produces cluster + instance + PSA + secret checks."""
-    args = _make_args(
-        service_name="svc", cluster_name="c1", instance_name="i1",
-        network_name="my-vpc",
+def test_validate_script_cloud_run_sections():
+    """Cloud Run selection includes Cloud Run + Artifact Registry + SA sections."""
+    script = generate_validate_script(
+        ["cloud_run", "iam"],
+        ["artifact_registry", "service_account"],
     )
-    derive_defaults(args)
-    checks = build_checks(args, {"alloydb", "iam"})
-    descs = [c[0] for c in checks]
-    assert any("AlloyDB cluster" in d for d in descs)
-    assert any("AlloyDB instance" in d for d in descs)
-    assert any("VPC network" in d for d in descs)
-    assert any("PSA range" in d for d in descs)
-    assert any("Secret" in d for d in descs)
+    assert "Cloud Run Services" in script
+    assert "Artifact Registry" in script
+    assert "Service Accounts" in script
+    assert "AlloyDB" not in script
+    assert "Secrets" not in script
 
 
-def test_build_checks_skips_default_vpc():
-    """Default network is not checked (it always exists)."""
-    args = _make_args(cluster_name="c1", network_name="default")
-    derive_defaults(args)
-    checks = build_checks(args, {"alloydb"})
-    descs = [c[0] for c in checks]
-    assert not any("VPC network" in d for d in descs)
-
-
-def test_build_checks_empty():
-    """No components = no checks."""
-    args = _make_args()
-    derive_defaults(args)
-    assert build_checks(args, set()) == []
-
-
-def test_build_checks_all_use_project_flag():
-    """Every gcloud command includes --project."""
-    args = _make_args(
-        service_name="svc", cluster_name="c1", instance_name="i1",
+def test_validate_script_alloydb_sections():
+    """AlloyDB selection includes AlloyDB + Secrets + VPC sections."""
+    script = generate_validate_script(
+        ["alloydb", "iam"],
+        ["vpc_network", "service_account", "secret_manager"],
     )
-    derive_defaults(args)
-    checks = build_checks(args, {"cloud_run", "alloydb", "iam"})
-    for desc, cmd in checks:
-        assert any("--project=" in c for c in cmd), f"Missing --project in: {desc}"
+    assert "AlloyDB Clusters" in script
+    assert "Secrets" in script
+    assert "VPC Networks" in script
+    assert "Compute Addresses" in script
+    assert "Cloud Run" not in script
+
+
+def test_validate_script_full_stack():
+    """Full stack includes all sections."""
+    script = generate_validate_script(
+        ["cloud_run", "iam", "alloydb"],
+        ["artifact_registry", "vpc_network", "service_account", "secret_manager"],
+    )
+    assert "Cloud Run" in script
+    assert "Artifact Registry" in script
+    assert "Service Accounts" in script
+    assert "AlloyDB" in script
+    assert "Secrets" in script
+    assert "VPC Networks" in script
+
+
+def test_validate_script_uses_gcloud_list():
+    """All resource discovery uses gcloud list, not describe."""
+    script = generate_validate_script(
+        ["cloud_run", "iam", "alloydb"],
+        ["artifact_registry", "vpc_network", "service_account", "secret_manager"],
+    )
+    assert "gcloud run services list" in script
+    assert "gcloud alloydb clusters list" in script
+    assert "gcloud secrets list" in script
+    assert " describe " not in script
 
 
 # ---------------------------------------------------------------------------
-# Cleanup: build_cleanup_steps
+# generate_cleanup_script
 # ---------------------------------------------------------------------------
 
-def test_cleanup_order_full_stack():
-    """Full-stack cleanup follows reverse dependency order."""
-    args = _make_args(
-        service_name="svc", cluster_name="c1", instance_name="i1",
-        network_name="my-vpc",
+def test_cleanup_script_header():
+    """Cleanup script has shebang, DRY_RUN support, and delete helper."""
+    script = generate_cleanup_script(["cloud_run"], ["artifact_registry", "service_account"])
+    assert script.startswith("#!/usr/bin/env bash")
+    assert "DRY_RUN" in script
+    assert "delete()" in script
+    assert "dry-run" in script
+
+
+def test_cleanup_script_order():
+    """Full-stack cleanup deletes in dependency order."""
+    script = generate_cleanup_script(
+        ["cloud_run", "iam", "alloydb"],
+        ["artifact_registry", "vpc_network", "service_account", "secret_manager"],
     )
-    derive_defaults(args)
-    steps = build_cleanup_steps(args, {"cloud_run", "alloydb", "iam"})
-    descs = [s[0] for s in steps]
+    # Extract section headers to verify order
+    lines = script.splitlines()
+    section_lines = [l for l in lines if l.startswith("echo \"---")]
+    labels = [l.split('"')[1].strip("--- ") for l in section_lines]
 
-    # Cloud Run must come before AlloyDB
-    run_idx = next(i for i, d in enumerate(descs) if "Cloud Run" in d)
-    cluster_idx = next(i for i, d in enumerate(descs) if "AlloyDB cluster" in d)
-    assert run_idx < cluster_idx
-
-    # AlloyDB instance must come before cluster
-    inst_idx = next(i for i, d in enumerate(descs) if "AlloyDB instance" in d)
-    assert inst_idx < cluster_idx
-
-    # SA must come after Cloud Run (service uses it)
-    sa_idx = next(i for i, d in enumerate(descs) if "service account" in d)
-    assert sa_idx > run_idx
-
-    # VPC must come last (everything depends on it)
-    vpc_idx = next(i for i, d in enumerate(descs) if "VPC network" in d)
-    assert vpc_idx == len(descs) - 1
+    # Cloud Run before AlloyDB
+    assert labels.index("Cloud Run Services") < labels.index("AlloyDB")
+    # Secrets before AlloyDB
+    assert labels.index("Secrets") < labels.index("AlloyDB")
+    # AlloyDB before Service Accounts
+    assert labels.index("AlloyDB") < labels.index("Service Accounts")
+    # Service Accounts before VPC Networks
+    sa_idx = labels.index("Service Accounts")
+    vpc_idx = labels.index("VPC Networks (non-default)")
+    assert sa_idx < vpc_idx
 
 
-def test_cleanup_skips_default_vpc():
-    """Default network is never deleted."""
-    args = _make_args(
-        service_name="svc", cluster_name="c1", network_name="default",
+def test_cleanup_script_uses_quiet():
+    """All delete commands use --quiet flag."""
+    script = generate_cleanup_script(
+        ["cloud_run", "iam", "alloydb"],
+        ["artifact_registry", "vpc_network", "service_account", "secret_manager"],
     )
-    derive_defaults(args)
-    steps = build_cleanup_steps(args, {"cloud_run", "alloydb", "iam"})
-    descs = [s[0] for s in steps]
-    assert not any("VPC network" in d for d in descs)
+    # Every "delete" gcloud line should have --quiet
+    for line in script.splitlines():
+        if "gcloud" in line and "delete" in line:
+            assert "--quiet" in line, f"Missing --quiet: {line.strip()}"
 
 
-def test_cleanup_all_use_quiet_flag():
-    """Every delete command includes --quiet to skip confirmation."""
-    args = _make_args(
-        service_name="svc", cluster_name="c1", instance_name="i1",
+def test_cleanup_script_dry_run_footer():
+    """Cleanup script reminds about dry-run mode."""
+    script = generate_cleanup_script(["cloud_run"], ["service_account"])
+    assert 'DRY_RUN=false' in script
+
+
+def test_cleanup_alloydb_instances_before_clusters():
+    """AlloyDB cleanup deletes instances before clusters (nested loop)."""
+    script = generate_cleanup_script(
+        ["alloydb", "iam"],
+        ["vpc_network", "service_account", "secret_manager"],
     )
-    derive_defaults(args)
-    steps = build_cleanup_steps(args, {"cloud_run", "alloydb", "iam"})
-    for desc, cmd in steps:
-        assert "--quiet" in cmd, f"Missing --quiet in: {desc}"
+    inst_pos = script.index("alloydb instances delete")
+    cluster_pos = script.index("alloydb clusters delete")
+    assert inst_pos < cluster_pos
 
 
-def test_cleanup_cloud_run_only():
-    """Cloud Run only cleanup: service + repo + SA."""
-    args = _make_args(service_name="svc")
-    derive_defaults(args)
-    steps = build_cleanup_steps(args, {"cloud_run", "iam"})
-    descs = [s[0] for s in steps]
-    assert len(steps) == 3
-    assert any("Cloud Run" in d for d in descs)
-    assert any("Artifact Registry" in d for d in descs)
-    assert any("service account" in d for d in descs)
+def test_cleanup_vpc_addresses_before_networks():
+    """PSA addresses are deleted before VPC networks."""
+    script = generate_cleanup_script(
+        ["alloydb", "iam"],
+        ["vpc_network", "service_account", "secret_manager"],
+    )
+    addr_pos = script.index("Compute Addresses")
+    net_pos = script.index("VPC Networks")
+    assert addr_pos < net_pos
 
 
-def test_cleanup_empty():
-    """No components = no steps."""
-    args = _make_args()
-    derive_defaults(args)
-    assert build_cleanup_steps(args, set()) == []
+# ---------------------------------------------------------------------------
+# End-to-end: generate() emits scripts
+# ---------------------------------------------------------------------------
+
+def test_generate_emits_validate_and_cleanup():
+    """The generator pipeline produces validate.sh and cleanup.sh in the bundle."""
+    fake_response = json.dumps({
+        "selected": ["cloud_run", "iam"],
+        "reasoning": {"cloud_run": "web app", "iam": "SA needed", "alloydb": None},
+        "supporting": ["artifact_registry", "service_account"],
+    })
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        spec_path = REPO_ROOT / "examples" / "book-journey" / "project.md"
+        output_dir = Path(tmpdir) / "bundle"
+        generate(
+            str(spec_path),
+            str(output_dir),
+            claude_caller=make_fake_claude(fake_response),
+        )
+
+        validate_sh = output_dir / "validate.sh"
+        cleanup_sh = output_dir / "cleanup.sh"
+        assert validate_sh.exists(), "validate.sh not generated"
+        assert cleanup_sh.exists(), "cleanup.sh not generated"
+
+        # validate.sh content matches components
+        v_content = validate_sh.read_text()
+        assert "Cloud Run" in v_content
+        assert "AlloyDB" not in v_content  # not selected
+
+        # cleanup.sh content matches components
+        c_content = cleanup_sh.read_text()
+        assert "Cloud Run" in c_content
+        assert "DRY_RUN" in c_content
+
+
+def test_generate_full_stack_scripts():
+    """Full-stack generation produces scripts with all sections."""
+    fake_response = json.dumps({
+        "selected": ["alloydb", "cloud_run", "iam"],
+        "reasoning": {
+            "cloud_run": "HTTP", "iam": "SA", "alloydb": "DB",
+        },
+        "supporting": ["artifact_registry", "secret_manager", "service_account", "vpc_network"],
+    })
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        spec_path = REPO_ROOT / "examples" / "book-journey" / "project.md"
+        output_dir = Path(tmpdir) / "bundle"
+        generate(
+            str(spec_path),
+            str(output_dir),
+            claude_caller=make_fake_claude(fake_response),
+        )
+
+        v_content = (output_dir / "validate.sh").read_text()
+        c_content = (output_dir / "cleanup.sh").read_text()
+        for keyword in ["Cloud Run", "AlloyDB", "Secrets", "VPC Networks"]:
+            assert keyword in v_content, f"validate.sh missing {keyword}"
+            assert keyword in c_content, f"cleanup.sh missing {keyword}"
+
+
+# ---------------------------------------------------------------------------
+# Global scanner: structure
+# ---------------------------------------------------------------------------
+
+def test_scanner_resource_types_ordered():
+    """Scanner resource types are in cleanup-dependency order."""
+    labels = [r[0] if r else "AlloyDB" for r in RESOURCE_TYPES]
+    assert labels.index("Cloud Run services") < labels.index("AlloyDB")
+    assert labels.index("Secrets") < labels.index("AlloyDB")
+    assert labels.index("AlloyDB") < labels.index("Service accounts (user-created)")
+    assert labels.index("Service accounts (user-created)") < labels.index("Compute addresses (PSA)")
+    assert labels.index("Compute addresses (PSA)") < labels.index("VPC networks (non-default)")
+
+
+def test_scanner_resource_types_have_delete():
+    """Every non-AlloyDB resource type has list and delete builders."""
+    for entry in RESOURCE_TYPES:
+        if entry is None:
+            continue
+        label, list_fn, delete_fn = entry
+        # Verify callables produce lists
+        list_cmd = list_fn("test-project", "us-central1")
+        assert isinstance(list_cmd, list)
+        assert "gcloud" in list_cmd[0]
+        delete_cmd = delete_fn("my-resource", "test-project", "us-central1")
+        assert isinstance(delete_cmd, list)
+        assert "--quiet" in delete_cmd
+
+
+def test_scanner_sa_filter_excludes_system():
+    """Service account listing filters out GCP-managed accounts."""
+    sa_entry = [r for r in RESOURCE_TYPES if r and "Service account" in r[0]][0]
+    list_cmd = sa_entry[1]("test-project", "us-central1")
+    cmd_str = " ".join(list_cmd)
+    assert "developer" in cmd_str
+    assert "appspot" in cmd_str
+    assert "cloudbuild" in cmd_str
+    assert "compute" in cmd_str
+
+
+def test_scanner_vpc_filter_excludes_default():
+    """VPC listing filters out the default network."""
+    vpc_entry = [r for r in RESOURCE_TYPES if r and "VPC" in r[0]][0]
+    list_cmd = vpc_entry[1]("test-project", "us-central1")
+    cmd_str = " ".join(list_cmd)
+    assert "name!=default" in cmd_str
